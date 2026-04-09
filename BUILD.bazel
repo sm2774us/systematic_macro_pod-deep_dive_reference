@@ -1,0 +1,41 @@
+##############################################################################
+# BUILD.bazel — Root build file
+##############################################################################
+
+# Python library
+py_library(
+    name = "quant_alpha_py",
+    srcs = glob(["src/python/*.py"]),
+    imports = ["src/python"],
+    visibility = ["//visibility:public"],
+)
+
+# Python tests
+py_test(
+    name = "py_tests",
+    srcs = glob(["src/python/tests/*.py"]),
+    deps = [":quant_alpha_py"],
+    args = ["--cov=src/python", "--cov-report=xml", "--cov-fail-under=100"],
+    main = "src/python/tests/test_all.py",
+)
+
+# C++ header-only library
+cc_library(
+    name = "quant_alpha_cpp",
+    hdrs = glob(["src/cpp/*.hpp"]),
+    includes = ["src/cpp"],
+    deps = ["@eigen//:eigen"],
+    visibility = ["//visibility:public"],
+)
+
+# C++ tests
+cc_test(
+    name = "cpp_tests",
+    srcs = ["src/cpp/tests/test_quant.cpp"],
+    deps = [
+        ":quant_alpha_cpp",
+        "@com_google_googletest//:gtest_main",
+        "@eigen//:eigen",
+    ],
+    copts = ["-std=c++26", "-Wall", "-Wextra", "-O2"],
+)

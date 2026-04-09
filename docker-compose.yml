@@ -1,0 +1,34 @@
+##############################################################################
+# docker-compose.yml
+##############################################################################
+version: "3.9"
+
+services:
+  quant-research:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: quant_alpha_research
+    volumes:
+      - .:/workspace
+      - quant_build_cache:/workspace/build
+    environment:
+      - PYTHONPATH=/workspace/src/python
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+    command: bash -c "pytest src/python/tests/ -v && cd build && ctest --output-on-failure"
+
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: quant_alpha_jupyter
+    ports:
+      - "8888:8888"
+    volumes:
+      - .:/workspace
+    environment:
+      - PYTHONPATH=/workspace/src/python
+    command: bash -c "pip install jupyter jupyterlab && jupyter lab --ip=0.0.0.0 --no-browser --allow-root"
+
+volumes:
+  quant_build_cache:

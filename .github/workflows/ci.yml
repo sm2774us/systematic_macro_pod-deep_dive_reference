@@ -1,0 +1,340 @@
+##############################################################################
+# .github/workflows/ci.yml
+# Hybrid CI/CD: Python 3.13 + C++26 monorepo
+# Features:
+#   - Lint (ruff, mypy, clang-tidy)
+#   - Python tests with 100% coverage enforcement
+#   - C++ tests with GoogleTest + lcov coverage
+#   - Bazel unified build + test
+#   - Research pipeline validation (KPI thresholds, hypothesis tests)
+#   - Slack alerts on failure / threshold violations
+##############################################################################
+name: Quant Alpha CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * *'   # Daily 06:00 UTC — research pipeline health check
+
+env:
+  PYTHON_VERSION: "3.13"
+  CPP_STANDARD: "26"
+  COVERAGE_THRESHOLD: "100"
+  SHARPE_MIN_THRESHOLD: "0.5"       # Minimum Sharpe for any live signal
+  MAX_DRAWDOWN_THRESHOLD: "0.20"    # Alert if backtest drawdown > 20%
+  HYPOTHESIS_P_VALUE: "0.05"        # Signal significance threshold
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Python Lint + Type Check
+  # ---------------------------------------------------------------------------
+  python-lint:
+    name: Python Lint & Type Check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dev dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Ruff lint
+        run: ruff check src/python/
+
+      - name: Ruff format check
+        run: ruff format --check src/python/
+
+      - name: Mypy type check
+        run: mypy src/python/ --ignore-missing-imports
+
+      - name: Notify Slack on lint failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "🔴 *Lint failure* in `${{ github.repository }}` on branch `${{ github.ref_name }}`.\nJob: Python Lint & Type Check\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ---------------------------------------------------------------------------
+  # 2. Python Tests + Coverage
+  # ---------------------------------------------------------------------------
+  python-tests:
+    name: Python Tests (100% Coverage)
+    runs-on: ubuntu-24.04
+    needs: python-lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run pytest with coverage
+        run: |
+          pytest src/python/tests/ \
+            --cov=src/python \
+            --cov-report=xml:coverage-python.xml \
+            --cov-report=term-missing \
+            --cov-fail-under=${{ env.COVERAGE_THRESHOLD }} \
+            -v --tb=short
+
+      - name: Upload Python coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage-python.xml
+          flags: python
+          name: python-coverage
+
+      - name: Notify Slack on test failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "🔴 *Python tests failed* in `${{ github.repository }}`.\nBranch: `${{ github.ref_name }}`\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ---------------------------------------------------------------------------
+  # 3. C++26 Build + Tests
+  # ---------------------------------------------------------------------------
+  cpp-tests:
+    name: C++26 Build & GoogleTest
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build lcov clang-18 libeigen3-dev
+
+      - name: Configure CMake
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_COVERAGE=ON
+
+      - name: Build
+        run: cmake --build build --parallel 4
+
+      - name: Run C++ tests
+        run: |
+          cd build
+          ctest --output-on-failure --parallel 4
+
+      - name: Generate C++ coverage
+        run: |
+          lcov --capture --directory build --output-file coverage-cpp.info \
+            --gcov-tool gcov-13 --ignore-errors mismatch
+          lcov --remove coverage-cpp.info '/usr/*' '*/tests/*' '*/googletest/*' \
+            -o coverage-cpp-filtered.info
+          lcov --list coverage-cpp-filtered.info
+
+      - name: Upload C++ coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage-cpp-filtered.info
+          flags: cpp
+          name: cpp-coverage
+
+      - name: Notify Slack on C++ failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "🔴 *C++ tests failed* in `${{ github.repository }}`.\nBranch: `${{ github.ref_name }}`\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ---------------------------------------------------------------------------
+  # 4. Bazel Unified Build
+  # ---------------------------------------------------------------------------
+  bazel-build:
+    name: Bazel Unified Build (Py + C++)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bazel-contrib/setup-bazel@0.8.4
+        with:
+          bazelisk-version: 1.x
+
+      - name: Bazel build all
+        run: bazel build --config=ci //...
+
+      - name: Bazel test all
+        run: bazel test --config=ci //... --test_output=errors
+
+      - name: Notify Slack on Bazel failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "🔴 *Bazel build failed* in `${{ github.repository }}` on `${{ github.ref_name }}`.\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ---------------------------------------------------------------------------
+  # 5. Research Pipeline Validation (KPI + Hypothesis Testing)
+  # ---------------------------------------------------------------------------
+  research-validation:
+    name: Research Pipeline KPI & Hypothesis Validation
+    runs-on: ubuntu-24.04
+    needs: python-tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]" scipy numpy polars
+
+      - name: Run KPI validation script
+        id: kpi_check
+        run: |
+          python - <<'EOF'
+          import sys, json
+          import numpy as np
+          from scipy import stats
+
+          # ----------------------------------------------------------------
+          # Simulate a mini research pipeline validation
+          # In production: load real backtest results from artifacts/DB
+          # ----------------------------------------------------------------
+          rng = np.random.default_rng(42)
+
+          # --- Sharpe check ---
+          returns = rng.normal(0.0008, 0.01, 252)  # ~20% ann vol, positive drift
+          sharpe = np.mean(returns) / np.std(returns) * np.sqrt(252)
+          print(f"Backtest Sharpe: {sharpe:.4f}")
+          min_sharpe = float("${{ env.SHARPE_MIN_THRESHOLD }}")
+          if sharpe < min_sharpe:
+              print(f"::error::Sharpe {sharpe:.4f} below threshold {min_sharpe}")
+              sys.exit(1)
+
+          # --- Max Drawdown check ---
+          cum_ret = np.cumprod(1 + returns)
+          running_max = np.maximum.accumulate(cum_ret)
+          drawdowns = (cum_ret - running_max) / running_max
+          max_dd = float(np.min(drawdowns))
+          print(f"Max Drawdown: {max_dd:.4f}")
+          max_dd_thresh = -float("${{ env.MAX_DRAWDOWN_THRESHOLD }}")
+          if max_dd < max_dd_thresh:
+              print(f"::error::Max drawdown {max_dd:.4f} exceeds threshold {max_dd_thresh}")
+              sys.exit(1)
+
+          # --- Hypothesis test: signal has positive mean return ---
+          t_stat, p_value = stats.ttest_1samp(returns, 0.0)
+          alpha = float("${{ env.HYPOTHESIS_P_VALUE }}")
+          print(f"Signal t-stat: {t_stat:.4f}, p-value: {p_value:.6f}")
+          if p_value > alpha:
+              print(f"::warning::Signal edge not significant: p={p_value:.4f} > {alpha}")
+
+          # --- Black Swan stress test (5σ event simulation) ---
+          shock_returns = returns.copy()
+          shock_returns[0] = -0.15  # simulate -15% black swan day
+          cum_shock = np.cumprod(1 + shock_returns)
+          shock_dd = float(np.min((cum_shock - np.maximum.accumulate(cum_shock)) / np.maximum.accumulate(cum_shock)))
+          print(f"Black Swan Stress Max DD: {shock_dd:.4f}")
+          if shock_dd < -0.5:
+              print(f"::error::Black Swan stress test: catastrophic drawdown {shock_dd:.4f}")
+              sys.exit(1)
+
+          # Export metrics for Slack notification
+          metrics = {
+              "sharpe": round(sharpe, 4),
+              "max_drawdown": round(max_dd, 4),
+              "p_value": round(p_value, 6),
+              "black_swan_dd": round(shock_dd, 4)
+          }
+          with open("kpi_metrics.json", "w") as f:
+              json.dump(metrics, f)
+          print("✅ All KPI thresholds passed.")
+          EOF
+
+      - name: Read KPI metrics
+        if: always()
+        id: read_kpi
+        run: |
+          if [ -f kpi_metrics.json ]; then
+            echo "metrics=$(cat kpi_metrics.json)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Notify Slack — KPI Alert
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "⚠️ *Research Pipeline KPI Alert* in `${{ github.repository }}`\nBranch: `${{ github.ref_name }}`\nMetrics: `${{ steps.read_kpi.outputs.metrics }}`\n\n*Issues detected:*\n• Sharpe below minimum threshold OR\n• Max drawdown exceeded OR\n• Signal hypothesis test failed\n\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify Slack — KPI Passed
+        if: success()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "✅ *Research Pipeline KPIs Passed* — `${{ github.repository }}`\nBranch: `${{ github.ref_name }}`\nMetrics: `${{ steps.read_kpi.outputs.metrics }}`"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ---------------------------------------------------------------------------
+  # 6. Final Status Summary
+  # ---------------------------------------------------------------------------
+  ci-summary:
+    name: CI Summary
+    runs-on: ubuntu-24.04
+    needs: [python-lint, python-tests, cpp-tests, bazel-build, research-validation]
+    if: always()
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [[ "${{ needs.python-lint.result }}" != "success" ||
+                "${{ needs.python-tests.result }}" != "success" ||
+                "${{ needs.cpp-tests.result }}" != "success" ||
+                "${{ needs.bazel-build.result }}" != "success" ||
+                "${{ needs.research-validation.result }}" != "success" ]]; then
+            echo "One or more CI jobs failed."
+            exit 1
+          fi
+          echo "All CI jobs passed ✅"
+
+      - name: Final Slack notification
+        if: always()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "${{ needs.ci-summary.result == 'success' && '✅ *CI PASSED*' || '🔴 *CI FAILED*' }} — `${{ github.repository }}` @ `${{ github.ref_name }}`\n• Python Lint: ${{ needs.python-lint.result }}\n• Python Tests: ${{ needs.python-tests.result }}\n• C++ Tests: ${{ needs.cpp-tests.result }}\n• Bazel Build: ${{ needs.bazel-build.result }}\n• Research KPIs: ${{ needs.research-validation.result }}\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

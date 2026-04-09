@@ -1,0 +1,18 @@
+# .bazelrc — Bazel build flags
+build --cxxopt='-std=c++26'
+build --cxxopt='-Wall'
+build --cxxopt='-Wextra'
+build --cxxopt='-O2'
+build --action_env=BAZEL_CXXOPTS="-std=c++26"
+
+# Test settings
+test --test_output=errors
+test --test_timeout=300
+
+# CI: treat all warnings as errors
+build:ci --cxxopt='-Werror'
+build:ci --compilation_mode=opt
+
+# Coverage
+coverage --combined_report=lcov
+coverage --instrumentation_filter="//src/..."
